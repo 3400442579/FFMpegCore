@@ -10,16 +10,16 @@ namespace FFMpegCore.Arguments
     /// </summary>
     public class InputPipeArgument : PipeArgument, IInputArgument
     {
-        public readonly IPipeDataWriter Writer;
+        public readonly IPipeSource Writer;
 
-        public InputPipeArgument(IPipeDataWriter writer) : base(PipeDirection.Out)
+        public InputPipeArgument(IPipeSource writer) : base(PipeDirection.Out)
         {
             Writer = writer;
         }
 
         public override string Text => $"-y {Writer.GetFormat()} -i \"{PipePath}\"";
 
-        public override async Task ProcessDataAsync(CancellationToken token)
+        protected override async Task ProcessDataAsync(CancellationToken token)
         {
             await Pipe.WaitForConnectionAsync(token).ConfigureAwait(false);
             if (!Pipe.IsConnected)

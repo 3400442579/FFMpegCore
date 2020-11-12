@@ -1,13 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace FFMpegCore
 {
-    public class MediaAnalysis
+    internal class MediaAnalysis : IMediaAnalysis
     {
+        private static readonly Regex DurationRegex = new Regex("^(\\d{1,2}:\\d{1,2}:\\d{1,2}(.\\d{1,7})?)", RegexOptions.Compiled);
         internal MediaAnalysis(string path, FFProbeAnalysis analysis)
         {
+            Format = ParseFormat(analysis.Format);
             VideoStreams = analysis.Streams.Where(stream => stream.CodecType == "video").Select(ParseVideoStream).ToList();
             AudioStreams = analysis.Streams.Where(stream => stream.CodecType == "audio").Select(ParseAudioStream).ToList();
             PrimaryVideoStream = VideoStreams.OrderBy(stream => stream.Index).FirstOrDefault();
@@ -15,13 +18,30 @@ namespace FFMpegCore
             Path = path;
         }
 
+        private MediaFormat ParseFormat(Format analysisFormat)
+        {
+            return new MediaFormat
+            {
+                Duration = TimeSpan.Parse(analysisFormat.Duration ?? "0"),
+                FormatName = analysisFormat.FormatName,
+                FormatLongName = analysisFormat.FormatLongName,
+                StreamCount = analysisFormat.NbStreams,
+                ProbeScore = analysisFormat.ProbeScore,
+                BitRate = long.Parse(analysisFormat.BitRate ?? "0")
+            };
+        }
 
         public string Path { get; }
         public string Extension => System.IO.Path.GetExtension(Path);
 
-        public TimeSpan Duration => TimeSpan.FromSeconds(Math.Max(
-            PrimaryVideoStream?.Duration.TotalSeconds ?? 0,
-            PrimaryAudioStream?.Duration.TotalSeconds ?? 0));
+        public TimeSpan Duration => new []
+        {
+            Format.Duration,
+            PrimaryVideoStream?.Duration ?? TimeSpan.Zero,
+            PrimaryAudioStream?.Duration ?? TimeSpan.Zero
+        }.Max();
+
+        public MediaFormat Format { get; }
         public AudioStream PrimaryAudioStream { get; }
 
         public VideoStream PrimaryVideoStream { get; }
@@ -46,15 +66,21 @@ namespace FFMpegCore
                 Width = stream.Width ?? 0,
                 Profile = stream.Profile,
                 PixelFormat = stream.PixelFormat,
-                Language = stream.Tags?.Language
+                Rotation = (int)float.Parse(stream.GetRotate() ?? "0"),
+                Language = stream.GetLanguage()
             };
         }
 
         private static TimeSpan ParseDuration(FFProbeStream ffProbeStream)
         {
-            return ffProbeStream.Duration != null
-                ? TimeSpan.FromSeconds(ParseDoubleInvariant(ffProbeStream.Duration))
-                : TimeSpan.Parse(ffProbeStream.Tags?.Duration ?? "0");
+            return !string.IsNullOrEmpty(ffProbeStream.Duration)
+                ? TimeSpan.Parse(ffProbeStream.Duration)
+                : TimeSpan.Parse(TrimTimeSpan(ffProbeStream.GetDuration()) ?? "0");
+        }
+        private static string? TrimTimeSpan(string? durationTag)
+        {
+            var durationMatch = DurationRegex.Match(durationTag ?? "");
+            return durationMatch.Success ? durationMatch.Groups[1].Value : null;
         }
 
         private AudioStream ParseAudioStream(FFProbeStream stream)
@@ -67,9 +93,10 @@ namespace FFMpegCore
                 CodecLongName = stream.CodecLongName,
                 Channels = stream.Channels ?? default,
                 ChannelLayout = stream.ChannelLayout,
-                Duration = TimeSpan.FromSeconds(ParseDoubleInvariant(stream.Duration ?? stream.Tags.Duration ?? "0")),
+                Duration = ParseDuration(stream),
                 SampleRateHz = !string.IsNullOrEmpty(stream.SampleRate) ? ParseIntInvariant(stream.SampleRate) : default,
-                Language = stream.Tags?.Language
+                Profile = stream.Profile,
+                Language = stream.GetLanguage()
             };
         }
 

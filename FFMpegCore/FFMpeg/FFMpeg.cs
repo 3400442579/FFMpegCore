@@ -7,6 +7,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 
 namespace FFMpegCore
 {
@@ -20,23 +21,35 @@ namespace FFMpegCore
         /// <param name="captureTime">Seek position where the thumbnail should be taken.</param>
         /// <param name="size">Thumbnail size. If width or height equal 0, the other will be computed automatically.</param>
         /// <returns>Bitmap with the requested snapshot.</returns>
-        public static bool Snapshot(MediaAnalysis source, string output, Size? size = null, TimeSpan? captureTime = null)
+        public static bool Snapshot(IMediaAnalysis source, string output, Size? size = null, TimeSpan? captureTime = null)
         {
-            captureTime ??= TimeSpan.FromSeconds(source.Duration.TotalSeconds / 3);
-
             if (Path.GetExtension(output) != FileExtension.Png)
                 output = Path.GetFileNameWithoutExtension(output) + FileExtension.Png;
 
-            size = PrepareSnapshotSize(source, size);
-
-            return FFMpegArguments
-                .FromInputFiles(source.Path)
-                .WithVideoCodec(VideoCodec.Png)
-                .WithFrameOutputCount(1)
-                .Resize(size)
-                .Seek(captureTime)
-                .OutputToFile(output)
+            var (arguments, outputOptions) = BuildSnapshotArguments(source, size, captureTime);
+            
+            return arguments
+                .OutputToFile(output, true, outputOptions)
                 .ProcessSynchronously();
+        }
+        /// <summary>
+        ///     Saves a 'png' thumbnail from the input video to drive
+        /// </summary>
+        /// <param name="source">Source video analysis</param>
+        /// <param name="output">Output video file path</param>
+        /// <param name="captureTime">Seek position where the thumbnail should be taken.</param>
+        /// <param name="size">Thumbnail size. If width or height equal 0, the other will be computed automatically.</param>
+        /// <returns>Bitmap with the requested snapshot.</returns>
+        public static Task<bool> SnapshotAsync(IMediaAnalysis source, string output, Size? size = null, TimeSpan? captureTime = null)
+        {
+            if (Path.GetExtension(output) != FileExtension.Png)
+                output = Path.GetFileNameWithoutExtension(output) + FileExtension.Png;
+
+            var (arguments, outputOptions) = BuildSnapshotArguments(source, size, captureTime);
+            
+            return arguments
+                .OutputToFile(output, true, outputOptions)
+                .ProcessAsynchronously();
         }
         /// <summary>
         ///     Saves a 'png' thumbnail to an in-memory bitmap
@@ -45,52 +58,79 @@ namespace FFMpegCore
         /// <param name="captureTime">Seek position where the thumbnail should be taken.</param>
         /// <param name="size">Thumbnail size. If width or height equal 0, the other will be computed automatically.</param>
         /// <returns>Bitmap with the requested snapshot.</returns>
-        public static Bitmap Snapshot(MediaAnalysis source, Size? size = null, TimeSpan? captureTime = null)
+        public static Bitmap Snapshot(IMediaAnalysis source, Size? size = null, TimeSpan? captureTime = null)
         {
-            captureTime ??= TimeSpan.FromSeconds(source.Duration.TotalSeconds / 3);
-
-            size = PrepareSnapshotSize(source, size);
-
+            var (arguments, outputOptions) = BuildSnapshotArguments(source, size, captureTime);
             using var ms = new MemoryStream();
-            FFMpegArguments
-                .FromInputFiles(source.Path)
-                .WithVideoCodec(VideoCodec.Png)
-                .WithFrameOutputCount(1)
-                .Resize(size)
-                .Seek(captureTime)
-                .ForceFormat("rawvideo")
-                .OutputToPipe(new StreamPipeDataReader(ms))
+            
+            arguments
+                .OutputToPipe(new StreamPipeSink(ms), options => outputOptions(options
+                    .ForceFormat("rawvideo")))
                 .ProcessSynchronously();
 
             ms.Position = 0;
             return new Bitmap(ms);
         }
-
-        private static Size? PrepareSnapshotSize(MediaAnalysis source, Size? size)
+        /// <summary>
+        ///     Saves a 'png' thumbnail to an in-memory bitmap
+        /// </summary>
+        /// <param name="source">Source video file.</param>
+        /// <param name="captureTime">Seek position where the thumbnail should be taken.</param>
+        /// <param name="size">Thumbnail size. If width or height equal 0, the other will be computed automatically.</param>
+        /// <returns>Bitmap with the requested snapshot.</returns>
+        public static async Task<Bitmap> SnapshotAsync(IMediaAnalysis source, Size? size = null, TimeSpan? captureTime = null)
         {
-            if (size == null || (size.Value.Height == 0 && size.Value.Width == 0))
-                size = new Size(source.PrimaryVideoStream.Width, source.PrimaryVideoStream.Height);
+            var (arguments, outputOptions) = BuildSnapshotArguments(source, size, captureTime);
+            using var ms = new MemoryStream();
+            
+            await arguments
+                .OutputToPipe(new StreamPipeSink(ms), options => outputOptions(options
+                    .ForceFormat("rawvideo")))
+                .ProcessAsynchronously();
 
-            if (size.Value.Width != size.Value.Height)
+            ms.Position = 0;
+            return new Bitmap(ms);
+        }
+
+        private static (FFMpegArguments, Action<FFMpegArgumentOptions> outputOptions) BuildSnapshotArguments(IMediaAnalysis source, Size? size = null, TimeSpan? captureTime = null)
+        {
+            captureTime ??= TimeSpan.FromSeconds(source.Duration.TotalSeconds / 3);
+            size = PrepareSnapshotSize(source, size);
+
+            return (FFMpegArguments
+                .FromFileInput(source, options => options
+                    .Seek(captureTime)), 
+                options => options
+                    .WithVideoCodec(VideoCodec.Png)
+                    .WithFrameOutputCount(1)
+                    .Resize(size));
+        }
+
+        private static Size? PrepareSnapshotSize(IMediaAnalysis source, Size? wantedSize)
+        {
+            if (wantedSize == null || (wantedSize.Value.Height <= 0 && wantedSize.Value.Width <= 0))
+                return null;
+            
+            var currentSize = new Size(source.PrimaryVideoStream.Width, source.PrimaryVideoStream.Height);
+            if (source.PrimaryVideoStream.Rotation == 90 || source.PrimaryVideoStream.Rotation == 180)
+                currentSize = new Size(source.PrimaryVideoStream.Height, source.PrimaryVideoStream.Width);
+            
+            if (wantedSize.Value.Width != currentSize.Width || wantedSize.Value.Height != currentSize.Height)
             {
-                if (size.Value.Width == 0)
+                if (wantedSize.Value.Width <= 0 && wantedSize.Value.Height > 0)
                 {
-                    var ratio = (double)size.Value.Height / source.PrimaryVideoStream.Height;
-
-                    size = new Size((int)(source.PrimaryVideoStream.Width * ratio),
-                        (int)(source.PrimaryVideoStream.Height * ratio));
+                    var ratio = (double)wantedSize.Value.Height / currentSize.Height;
+                    return new Size((int)(currentSize.Width * ratio), (int)(currentSize.Height * ratio));
                 }
-
-                if (size.Value.Height == 0)
+                if (wantedSize.Value.Height <= 0 && wantedSize.Value.Width > 0)
                 {
-                    var ratio = (double)size.Value.Width / source.PrimaryVideoStream.Width;
-
-                    size = new Size((int)(source.PrimaryVideoStream.Width * ratio),
-                        (int)(source.PrimaryVideoStream.Height * ratio));
+                    var ratio = (double)wantedSize.Value.Width / currentSize.Width;
+                    return new Size((int)(currentSize.Width * ratio), (int)(currentSize.Height * ratio));
                 }
+                return wantedSize;
             }
 
-            return size;
+            return null;
         }
 
         /// <summary>
@@ -105,7 +145,7 @@ namespace FFMpegCore
         /// <param name="multithreaded">Is encoding multithreaded.</param>
         /// <returns>Output video information.</returns>
         public static bool Convert(
-            MediaAnalysis source,
+            IMediaAnalysis source,
             string output,
             ContainerFormat format,
             Speed speed = Speed.SuperFast,
@@ -125,44 +165,44 @@ namespace FFMpegCore
             return format.Name switch
             {
                 "mp4" => FFMpegArguments
-                    .FromInputFiles(true, source.Path)
-                    .UsingMultithreading(multithreaded)
-                    .WithVideoCodec(VideoCodec.LibX264)
-                    .WithVideoBitrate(2400)
-                    .Scale(outputSize)
-                    .WithSpeedPreset(speed)
-                    .WithAudioCodec(AudioCodec.Aac)
-                    .WithAudioBitrate(audioQuality)
-                    .OutputToFile(output)
+                    .FromFileInput(source)
+                    .OutputToFile(output, true, options => options
+                        .UsingMultithreading(multithreaded)
+                        .WithVideoCodec(VideoCodec.LibX264)
+                        .WithVideoBitrate(2400)
+                        .Scale(outputSize)
+                        .WithSpeedPreset(speed)
+                        .WithAudioCodec(AudioCodec.Aac)
+                        .WithAudioBitrate(audioQuality))
                     .ProcessSynchronously(),
                 "ogv" => FFMpegArguments
-                    .FromInputFiles(true, source.Path)
-                    .UsingMultithreading(multithreaded)
-                    .WithVideoCodec(VideoCodec.LibTheora)
-                    .WithVideoBitrate(2400)
-                    .Scale(outputSize)
-                    .WithSpeedPreset(speed)
-                    .WithAudioCodec(AudioCodec.LibVorbis)
-                    .WithAudioBitrate(audioQuality)
-                    .OutputToFile(output)
+                    .FromFileInput(source)
+                    .OutputToFile(output, true, options => options
+                        .UsingMultithreading(multithreaded)
+                        .WithVideoCodec(VideoCodec.LibTheora)
+                        .WithVideoBitrate(2400)
+                        .Scale(outputSize)
+                        .WithSpeedPreset(speed)
+                        .WithAudioCodec(AudioCodec.LibVorbis)
+                        .WithAudioBitrate(audioQuality))
                     .ProcessSynchronously(),
                 "mpegts" => FFMpegArguments
-                    .FromInputFiles(true, source.Path)
-                    .CopyChannel()
-                    .WithBitStreamFilter(Channel.Video, Filter.H264_Mp4ToAnnexB)
-                    .ForceFormat(VideoType.Ts)
-                    .OutputToFile(output)
+                    .FromFileInput(source)
+                    .OutputToFile(output, true, options => options
+                        .CopyChannel()
+                        .WithBitStreamFilter(Channel.Video, Filter.H264_Mp4ToAnnexB)
+                        .ForceFormat(VideoType.Ts))
                     .ProcessSynchronously(),
                 "webm" => FFMpegArguments
-                    .FromInputFiles(true, source.Path)
-                    .UsingMultithreading(multithreaded)
-                    .WithVideoCodec(VideoCodec.LibVpx)
-                    .WithVideoBitrate(2400)
-                    .Scale(outputSize)
-                    .WithSpeedPreset(speed)
-                    .WithAudioCodec(AudioCodec.LibVorbis)
-                    .WithAudioBitrate(audioQuality)
-                    .OutputToFile(output)
+                    .FromFileInput(source)
+                    .OutputToFile(output, true, options => options
+                        .UsingMultithreading(multithreaded)
+                        .WithVideoCodec(VideoCodec.LibVpx)
+                        .WithVideoBitrate(2400)
+                        .Scale(outputSize)
+                        .WithSpeedPreset(speed)
+                        .WithAudioCodec(AudioCodec.LibVorbis)
+                        .WithAudioBitrate(audioQuality))
                     .ProcessSynchronously(),
                 _ => throw new ArgumentOutOfRangeException(nameof(format))
             };
@@ -181,13 +221,14 @@ namespace FFMpegCore
             FFMpegHelper.ConversionSizeExceptionCheck(Image.FromFile(image));
 
             return FFMpegArguments
-                .FromInputFiles(true, image, audio)
-                .Loop(1)
-                .WithVideoCodec(VideoCodec.LibX264)
-                .WithConstantRateFactor(21)
-                .WithAudioBitrate(AudioQuality.Normal)
-                .UsingShortest()
-                .OutputToFile(output)
+                .FromFileInput(image)
+                .AddFileInput(audio)
+                .OutputToFile(output, true, options => options
+                    .Loop(1)
+                    .WithVideoCodec(VideoCodec.LibX264)
+                    .WithConstantRateFactor(21)
+                    .WithAudioBitrate(AudioQuality.Normal)
+                    .UsingShortest())
                 .ProcessSynchronously();
         }
 
@@ -197,7 +238,7 @@ namespace FFMpegCore
         /// <param name="output">Output video file.</param>
         /// <param name="videos">List of vides that need to be joined together.</param>
         /// <returns>Output video information.</returns>
-        public static bool Join(string output, params MediaAnalysis[] videos)
+        public static bool Join(string output, params IMediaAnalysis[] videos)
         {
             var temporaryVideoParts = videos.Select(video =>
             {
@@ -211,16 +252,26 @@ namespace FFMpegCore
             try
             {
                 return FFMpegArguments
-                    .FromConcatenation(temporaryVideoParts)
-                    .CopyChannel()
-                    .WithBitStreamFilter(Channel.Audio, Filter.Aac_AdtstoAsc)
-                    .OutputToFile(output)
+                    .FromConcatInput(temporaryVideoParts)
+                    .OutputToFile(output, true, options => options
+                        .CopyChannel()
+                        .WithBitStreamFilter(Channel.Audio, Filter.Aac_AdtstoAsc))
                     .ProcessSynchronously();
             }
             finally
             {
                 Cleanup(temporaryVideoParts);
             }
+        }
+        /// <summary>
+        ///     Joins a list of video files.
+        /// </summary>
+        /// <param name="output">Output video file.</param>
+        /// <param name="videos">List of vides that need to be joined together.</param>
+        /// <returns>Output video information.</returns>
+        public static bool Join(string output, params string[] videos)
+        {
+            return Join(output, videos.Select(videoPath => FFProbe.Analyse(videoPath)).ToArray());
         }
 
         /// <summary>
@@ -232,11 +283,12 @@ namespace FFMpegCore
         /// <returns>Output video information.</returns>
         public static bool JoinImageSequence(string output, double frameRate = 30, params ImageInfo[] images)
         {
+            var tempFolderName = Path.Combine(FFMpegOptions.Options.TempDirectory, Guid.NewGuid().ToString());
             var temporaryImageFiles = images.Select((image, index) =>
             {
                 FFMpegHelper.ConversionSizeExceptionCheck(Image.FromFile(image.FullName));
-                var destinationPath = Path.Combine(FFMpegOptions.Options.TempDirectory, $"{index.ToString().PadLeft(9, '0')}{image.Extension}");
-                Directory.CreateDirectory(FFMpegOptions.Options.TempDirectory);
+                var destinationPath = Path.Combine(tempFolderName, $"{index.ToString().PadLeft(9, '0')}{image.Extension}");
+                Directory.CreateDirectory(tempFolderName);
                 File.Copy(image.FullName, destinationPath);
                 return destinationPath;
             }).ToArray();
@@ -245,18 +297,16 @@ namespace FFMpegCore
             try
             {
                 return FFMpegArguments
-                    .FromInputFiles(false, Path.Combine(FFMpegOptions.Options.TempDirectory, "%09d.png"))
-                    .WithVideoCodec(VideoCodec.LibX264)
-                    .Resize(firstImage.Width, firstImage.Height)
-                    .WithFrameOutputCount(images.Length)
-                    .WithStartNumber(0)
-                    .WithFramerate(frameRate)
-                    .OutputToFile(output)
+                    .FromFileInput(Path.Combine(tempFolderName, "%09d.png"), false)
+                    .OutputToFile(output, true, options => options
+                        .Resize(firstImage.Width, firstImage.Height)
+                        .WithFramerate(frameRate))
                     .ProcessSynchronously();
             }
             finally
             {
                 Cleanup(temporaryImageFiles);
+                Directory.Delete(tempFolderName);
             }
         }
 
@@ -274,7 +324,7 @@ namespace FFMpegCore
                 throw new ArgumentException($"Uri: {uri.AbsoluteUri}, does not point to a valid http(s) stream.");
             
             return FFMpegArguments
-                .FromInputFiles(false, uri)
+                .FromUrlInput(uri)
                 .OutputToFile(output)
                 .ProcessSynchronously();
         }
@@ -292,10 +342,10 @@ namespace FFMpegCore
             FFMpegHelper.ExtensionExceptionCheck(output, source.Extension);
 
             return FFMpegArguments
-                .FromInputFiles(true, source.Path)
-                .CopyChannel(Channel.Video)
-                .DisableChannel(Channel.Audio)
-                .OutputToFile(output)
+                .FromFileInput(source)
+                .OutputToFile(output, true, options => options
+                    .CopyChannel(Channel.Video)
+                    .DisableChannel(Channel.Audio))
                 .ProcessSynchronously();
         }
 
@@ -310,9 +360,9 @@ namespace FFMpegCore
             FFMpegHelper.ExtensionExceptionCheck(output, FileExtension.Mp3);
 
             return FFMpegArguments
-                .FromInputFiles(true, input)
-                .DisableChannel(Channel.Video)
-                .OutputToFile(output)
+                .FromFileInput(input)
+                .OutputToFile(output, true, options => options
+                    .DisableChannel(Channel.Video))
                 .ProcessSynchronously();
         }
 
@@ -331,26 +381,27 @@ namespace FFMpegCore
             FFMpegHelper.ExtensionExceptionCheck(output, source.Extension);
 
             return FFMpegArguments
-                .FromInputFiles(true, source.Path, inputAudio)
-                .CopyChannel()
-                .WithAudioCodec(AudioCodec.Aac)
-                .WithAudioBitrate(AudioQuality.Good)
-                .UsingShortest(stopAtShortest)
-                .OutputToFile(output)
+                .FromFileInput(source)
+                .AddFileInput(inputAudio)
+                .OutputToFile(output, true, options => options
+                    .CopyChannel()
+                    .WithAudioCodec(AudioCodec.Aac)
+                    .WithAudioBitrate(AudioQuality.Good)
+                    .UsingShortest(stopAtShortest))
                 .ProcessSynchronously();
         }
 
         #region PixelFormats
-        internal static IReadOnlyList<Enums.PixelFormat> GetPixelFormatsInternal()
+        internal static IReadOnlyList<PixelFormat> GetPixelFormatsInternal()
         {
-            FFMpegHelper.RootExceptionCheck(FFMpegOptions.Options.RootDirectory);
+            FFMpegHelper.RootExceptionCheck();
 
-            var list = new List<Enums.PixelFormat>();
+            var list = new List<PixelFormat>();
             using var instance = new Instances.Instance(FFMpegOptions.Options.FFmpegBinary(), "-pix_fmts");
             instance.DataReceived += (e, args) =>
             {
-                if (Enums.PixelFormat.TryParse(args.Data, out var fmt))
-                    list.Add(fmt);
+                if (PixelFormat.TryParse(args.Data, out var format))
+                    list.Add(format);
             };
 
             var exitCode = instance.BlockUntilFinished();
@@ -359,14 +410,14 @@ namespace FFMpegCore
             return list.AsReadOnly();
         }
 
-        public static IReadOnlyList<Enums.PixelFormat> GetPixelFormats()
+        public static IReadOnlyList<PixelFormat> GetPixelFormats()
         {
             if (!FFMpegOptions.Options.UseCache)
                 return GetPixelFormatsInternal();
             return FFMpegCache.PixelFormats.Values.ToList().AsReadOnly();
         }
 
-        public static bool TryGetPixelFormat(string name, out Enums.PixelFormat fmt)
+        public static bool TryGetPixelFormat(string name, out PixelFormat fmt)
         {
             if (!FFMpegOptions.Options.UseCache)
             {
@@ -377,7 +428,7 @@ namespace FFMpegCore
                 return FFMpegCache.PixelFormats.TryGetValue(name, out fmt);
         }
 
-        public static Enums.PixelFormat GetPixelFormat(string name)
+        public static PixelFormat GetPixelFormat(string name)
         {
             if (TryGetPixelFormat(name, out var fmt))
                 return fmt;
@@ -386,9 +437,10 @@ namespace FFMpegCore
         #endregion
 
         #region Codecs
-        internal static void ParsePartOfCodecs(Dictionary<string, Codec> codecs, string arguments, Func<string, Codec?> parser)
+
+        private static void ParsePartOfCodecs(Dictionary<string, Codec> codecs, string arguments, Func<string, Codec?> parser)
         {
-            FFMpegHelper.RootExceptionCheck(FFMpegOptions.Options.RootDirectory);
+            FFMpegHelper.RootExceptionCheck();
 
             using var instance = new Instances.Instance(FFMpegOptions.Options.FFmpegBinary(), arguments);
             instance.DataReceived += (e, args) =>
@@ -471,7 +523,7 @@ namespace FFMpegCore
         #region ContainerFormats
         internal static IReadOnlyList<ContainerFormat> GetContainersFormatsInternal()
         {
-            FFMpegHelper.RootExceptionCheck(FFMpegOptions.Options.RootDirectory);
+            FFMpegHelper.RootExceptionCheck();
 
             var list = new List<ContainerFormat>();
             using var instance = new Instances.Instance(FFMpegOptions.Options.FFmpegBinary(), "-formats");

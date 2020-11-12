@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Text.RegularExpressions;
@@ -12,17 +13,16 @@ namespace FFMpegCore
 {
     public class FFMpegArgumentProcessor
     {
+        private static readonly Regex ProgressRegex = new Regex(@"time=(\d\d:\d\d:\d\d.\d\d?)", RegexOptions.Compiled);
         private readonly FFMpegArguments _ffMpegArguments;
+        private Action<double>? _onPercentageProgress;
+        private Action<TimeSpan>? _onTimeProgress;
+        private TimeSpan? _totalTimespan;
 
         internal FFMpegArgumentProcessor(FFMpegArguments ffMpegArguments)
         {
             _ffMpegArguments = ffMpegArguments;
         }
-
-        /// <summary>
-        /// Returns the percentage of the current conversion progress.
-        /// </summary>
-        // public event ConversionHandler OnProgress;
 
         public string Arguments => _ffMpegArguments.Text;
 
@@ -46,119 +46,113 @@ namespace FFMpegCore
         }
         public bool ProcessSynchronously(bool throwOnError = true)
         {
-            var instance = PrepareInstance(out var cancellationTokenSource, out var errorCode);
+            using var instance = PrepareInstance(out var cancellationTokenSource);
+            var errorCode = -1;
 
             void OnCancelEvent(object sender, EventArgs args)
             {
-                instance?.SendInput("q");
+                instance.SendInput("q");
                 cancellationTokenSource.Cancel();
+                instance.Started = false;
             }
             CancelEvent += OnCancelEvent;
+            instance.Exited += delegate { cancellationTokenSource.Cancel(); };
             
-            _ffMpegArguments.Pre();
             try
             {
+                _ffMpegArguments.Pre();
                 Task.WaitAll(instance.FinishedRunning().ContinueWith(t =>
                 {
                     errorCode = t.Result;
                     cancellationTokenSource.Cancel();
+                    _ffMpegArguments.Post();
                 }), _ffMpegArguments.During(cancellationTokenSource.Token));
             }
             catch (Exception e)
             {
-                if (!HandleException(throwOnError, e, instance)) return false;
+                if (!HandleException(throwOnError, e, instance.ErrorData)) return false;
             }
             finally
             {
                 CancelEvent -= OnCancelEvent;
-                _ffMpegArguments.Post();
             }
             
+            return HandleCompletion(throwOnError, errorCode, instance.ErrorData);
+        }
+
+        private bool HandleCompletion(bool throwOnError, int errorCode, IReadOnlyList<string> errorData)
+        {
             if (throwOnError && errorCode != 0)
-                throw new FFMpegException(FFMpegExceptionType.Conversion, string.Join("\n", instance.ErrorData));
-            
+                throw new FFMpegException(FFMpegExceptionType.Conversion, string.Join("\n", errorData));
+
             _onPercentageProgress?.Invoke(100.0);
             if (_totalTimespan.HasValue) _onTimeProgress?.Invoke(_totalTimespan.Value);
-            
+
             return errorCode == 0;
         }
-        
+
         public async Task<bool> ProcessAsynchronously(bool throwOnError = true)
         {
-            using var instance = PrepareInstance(out var cancellationTokenSource, out var errorCode);
+            using var instance = PrepareInstance(out var cancellationTokenSource);
+            var errorCode = -1;
 
             void OnCancelEvent(object sender, EventArgs args)
             {
                 instance?.SendInput("q");
                 cancellationTokenSource.Cancel();
+                instance.Started = false;
             }
             CancelEvent += OnCancelEvent;
             
-            _ffMpegArguments.Pre();
             try
             {
+                _ffMpegArguments.Pre();
                 await Task.WhenAll(instance.FinishedRunning().ContinueWith(t =>
                 {
                     errorCode = t.Result;
                     cancellationTokenSource.Cancel();
+                    _ffMpegArguments.Post();
                 }), _ffMpegArguments.During(cancellationTokenSource.Token)).ConfigureAwait(false);
             }
             catch (Exception e)
             {
-                if (!HandleException(throwOnError, e, instance)) return false;
+                if (!HandleException(throwOnError, e, instance.ErrorData)) return false;
             }
             finally
             {
                 CancelEvent -= OnCancelEvent;
-                _ffMpegArguments.Post();
             }
-            
-            if (throwOnError && errorCode != 0)
-                throw new FFMpegException(FFMpegExceptionType.Conversion, string.Join("\n", instance.ErrorData));
-            
-            _onPercentageProgress?.Invoke(100.0);
-            if (_totalTimespan.HasValue) _onTimeProgress?.Invoke(_totalTimespan.Value);
-            
-            return errorCode == 0;
+
+            return HandleCompletion(throwOnError, errorCode, instance.ErrorData);
         }
 
-        private Instance PrepareInstance(out CancellationTokenSource cancellationTokenSource, out int errorCode)
+        private Instance PrepareInstance(out CancellationTokenSource cancellationTokenSource)
         {
-            FFMpegHelper.RootExceptionCheck(FFMpegOptions.Options.RootDirectory);
+            FFMpegHelper.RootExceptionCheck();
+            FFMpegHelper.VerifyFFMpegExists();
             var instance = new Instance(FFMpegOptions.Options.FFmpegBinary(), _ffMpegArguments.Text);
-            instance.DataReceived += OutputData;
             cancellationTokenSource = new CancellationTokenSource();
 
             if (_onTimeProgress != null || (_onPercentageProgress != null && _totalTimespan != null))
                 instance.DataReceived += OutputData;
 
-            errorCode = -1;
-            
             return instance;
         }
+
         
-        private static bool HandleException(bool throwOnError, Exception e, Instance instance)
+        private static bool HandleException(bool throwOnError, Exception e, IReadOnlyList<string> errorData)
         {
             if (!throwOnError)
                 return false;
 
             throw new FFMpegException(FFMpegExceptionType.Process, "Exception thrown during processing", e,
-                string.Join("\n", instance.ErrorData));
+                string.Join("\n", errorData));
         }
-
-
-        private static readonly Regex ProgressRegex = new Regex(@"time=(\d\d:\d\d:\d\d.\d\d?)", RegexOptions.Compiled);
-        private Action<double>? _onPercentageProgress;
-        private Action<TimeSpan>? _onTimeProgress;
-        private TimeSpan? _totalTimespan;
 
         private void OutputData(object sender, (DataType Type, string Data) msg)
         {
-#if DEBUG
-            Trace.WriteLine(msg.Data);
-#endif
-
             var match = ProgressRegex.Match(msg.Data);
+            Debug.WriteLine(msg.Data);
             if (!match.Success) return;
 
             var processed = TimeSpan.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);

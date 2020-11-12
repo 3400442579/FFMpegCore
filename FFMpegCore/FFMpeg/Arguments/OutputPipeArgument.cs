@@ -7,16 +7,16 @@ namespace FFMpegCore.Arguments
 {
     public class OutputPipeArgument : PipeArgument, IOutputArgument
     {
-        public readonly IPipeDataReader Reader;
+        public readonly IPipeSink Reader;
 
-        public OutputPipeArgument(IPipeDataReader reader) : base(PipeDirection.In)
+        public OutputPipeArgument(IPipeSink reader) : base(PipeDirection.In)
         {
             Reader = reader;
         }
 
         public override string Text => $"\"{PipePath}\" -y";
 
-        public override async Task ProcessDataAsync(CancellationToken token)
+        protected override async Task ProcessDataAsync(CancellationToken token)
         {
             await Pipe.WaitForConnectionAsync(token).ConfigureAwait(false);
             if (!Pipe.IsConnected)

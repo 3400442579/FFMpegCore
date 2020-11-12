@@ -12,15 +12,24 @@ namespace FFMpegCore
 {
     public static class FFProbe
     {
-        public static MediaAnalysis Analyse(string filePath, int outputCapacity = int.MaxValue)
+        public static IMediaAnalysis Analyse(string filePath, int outputCapacity = int.MaxValue)
         {
+            if (!File.Exists(filePath)) 
+                throw new FFMpegException(FFMpegExceptionType.File, $"No file found at '{filePath}'");
+            
             using var instance = PrepareInstance(filePath, outputCapacity);
             instance.BlockUntilFinished();
             return ParseOutput(filePath, instance);
         }
-        public static MediaAnalysis Analyse(System.IO.Stream stream, int outputCapacity = int.MaxValue)
+        public static IMediaAnalysis Analyse(Uri uri, int outputCapacity = int.MaxValue)
         {
-            var streamPipeSource = new StreamPipeDataWriter(stream);
+            using var instance = PrepareInstance(uri.AbsoluteUri, outputCapacity);
+            instance.BlockUntilFinished();
+            return ParseOutput(uri.AbsoluteUri, instance);
+        }
+        public static IMediaAnalysis Analyse(Stream stream, int outputCapacity = int.MaxValue)
+        {
+            var streamPipeSource = new StreamPipeSource(stream);
             var pipeArgument = new InputPipeArgument(streamPipeSource);
             using var instance = PrepareInstance(pipeArgument.PipePath, outputCapacity);
             pipeArgument.Pre();
@@ -41,15 +50,24 @@ namespace FFMpegCore
             
             return ParseOutput(pipeArgument.PipePath, instance);
         }
-        public static async Task<MediaAnalysis> AnalyseAsync(string filePath, int outputCapacity = int.MaxValue)
+        public static async Task<IMediaAnalysis> AnalyseAsync(string filePath, int outputCapacity = int.MaxValue)
         {
+            if (!File.Exists(filePath)) 
+                throw new FFMpegException(FFMpegExceptionType.File, $"No file found at '{filePath}'");
+            
             using var instance = PrepareInstance(filePath, outputCapacity);
             await instance.FinishedRunning();
             return ParseOutput(filePath, instance);
         }
-        public static async Task<MediaAnalysis> AnalyseAsync(System.IO.Stream stream, int outputCapacity = int.MaxValue)
+        public static async Task<IMediaAnalysis> AnalyseAsync(Uri uri, int outputCapacity = int.MaxValue)
         {
-            var streamPipeSource = new StreamPipeDataWriter(stream);
+            using var instance = PrepareInstance(uri.AbsoluteUri, outputCapacity);
+            await instance.FinishedRunning();
+            return ParseOutput(uri.AbsoluteUri, instance);
+        }
+        public static async Task<IMediaAnalysis> AnalyseAsync(Stream stream, int outputCapacity = int.MaxValue)
+        {
+            var streamPipeSource = new StreamPipeSource(stream);
             var pipeArgument = new InputPipeArgument(streamPipeSource);
             using var instance = PrepareInstance(pipeArgument.PipePath, outputCapacity);
             pipeArgument.Pre();
@@ -74,7 +92,7 @@ namespace FFMpegCore
             return ParseOutput(pipeArgument.PipePath, instance);
         }
 
-        private static MediaAnalysis ParseOutput(string filePath, Instance instance)
+        private static IMediaAnalysis ParseOutput(string filePath, Instance instance)
         {
             var json = string.Join(string.Empty, instance.OutputData);
             var ffprobeAnalysis = JsonSerializer.Deserialize<FFProbeAnalysis>(json, new JsonSerializerOptions
@@ -86,10 +104,10 @@ namespace FFMpegCore
 
         private static Instance PrepareInstance(string filePath, int outputCapacity)
         {
-            FFProbeHelper.RootExceptionCheck(FFMpegOptions.Options.RootDirectory);
-            var ffprobe = FFMpegOptions.Options.FFProbeBinary();
-            var arguments = $"-print_format json -show_streams \"{filePath}\"";
-            var instance = new Instance(ffprobe, arguments) {DataBufferCapacity = outputCapacity};
+            FFProbeHelper.RootExceptionCheck();
+            FFProbeHelper.VerifyFFProbeExists();
+            var arguments = $"-print_format json -show_format -sexagesimal -show_streams \"{filePath}\"";
+            var instance = new Instance(FFMpegOptions.Options.FFProbeBinary(), arguments) {DataBufferCapacity = outputCapacity};
             return instance;
         }
     }
